@@ -1,0 +1,797 @@
+// server.js
+const express = require('express');
+const axios = require('axios');
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Configuration from environment variables
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const W2G_API_KEY = process.env.W2G_API_KEY;
+
+// In-memory storage
+let appState = {
+  folderId: null,
+  roomId: null,
+  currentEpisodeIndex: 0,
+  episodes: []
+};
+
+app.use(express.json());
+app.use(express.static('public'));
+
+// Extract folder ID from Google Drive URL
+function extractFolderId(url) {
+  const patterns = [
+    /\/folders\/([a-zA-Z0-9-_]+)/,
+    /id=([a-zA-Z0-9-_]+)/,
+    /^([a-zA-Z0-9-_]+)$/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+// Convert Google Drive file to streaming URL
+function getDriveStreamUrl(fileId) {
+  return `https://drive.google.com/file/d/${fileId}/preview`;
+}
+
+// Fetch video files from Google Drive folder
+async function fetchVideos(folderId) {
+  try {
+    let allFiles = [];
+    let pageToken = null;
+    
+    do {
+      const url = `https://www.googleapis.com/drive/v3/files`;
+      const params = {
+        key: GOOGLE_API_KEY,
+        q: `'${folderId}' in parents and (mimeType contains 'video/' or mimeType contains 'application/')`,
+        fields: 'nextPageToken, files(id, name, mimeType, webViewLink, webContentLink)',
+        pageSize: 1000, // Maximum allowed
+        orderBy: 'name',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true
+      };
+      
+      if (pageToken) {
+        params.pageToken = pageToken;
+      }
+      
+      console.log('Fetching videos from folder:', folderId, 'Page token:', pageToken || 'first page');
+      const response = await axios.get(url, { params });
+      
+      const files = response.data.files || [];
+      allFiles = allFiles.concat(files);
+      pageToken = response.data.nextPageToken;
+      
+      console.log('Fetched', files.length, 'files. Total so far:', allFiles.length);
+    } while (pageToken);
+    
+    console.log('Total files found:', allFiles.length);
+    
+    // Add streaming URL to each video
+    return allFiles.map(file => ({
+      ...file,
+      streamUrl: getDriveStreamUrl(file.id)
+    }));
+  } catch (error) {
+    console.error('Error fetching videos:', error.response?.data || error.message);
+    const errorMsg = error.response?.data?.error?.message || error.message;
+    throw new Error(`Failed to fetch videos: ${errorMsg}`);
+  }
+}
+
+// Create Watch2Gether room
+async function createW2GRoom() {
+  try {
+    console.log('Creating W2G room...');
+    const response = await axios.post(
+      'https://api.w2g.tv/rooms/create.json',
+      {
+        w2g_api_key: W2G_API_KEY,
+        share: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        bg_color: '#1a1a1a',
+        bg_opacity: '90'
+      }
+    );
+    console.log('W2G room created:', response.data.streamkey);
+    return response.data.streamkey;
+  } catch (error) {
+    console.error('Error creating W2G room:', error.response?.data || error.message);
+    const errorMsg = error.response?.data?.error || error.message;
+    throw new Error(`Failed to create Watch2Gether room: ${errorMsg}`);
+  }
+}
+
+// Update Watch2Gether room with new video
+async function updateW2GRoom(roomId, videoUrl) {
+  try {
+    const response = await axios.post(
+      `https://api.w2g.tv/rooms/${roomId}/sync_update`,
+      {
+        w2g_api_key: W2G_API_KEY,
+        item_url: videoUrl
+      }
+    );
+    return response.data;
+  } catch (error) {
+    console.error('Error updating W2G room:', error.response?.data || error.message);
+    throw new Error(`Failed to update Watch2Gether room: ${errorMsg}`);
+  }
+}
+
+// API Endpoints
+
+// Initialize with folder
+app.post('/api/init', async (req, res) => {
+  try {
+    const { folderUrl } = req.body;
+    console.log('Received folder URL:', folderUrl);
+    
+    const folderId = extractFolderId(folderUrl);
+    console.log('Extracted folder ID:', folderId);
+    
+    if (!folderId) {
+      return res.status(400).json({ error: 'Invalid Google Drive folder URL' });
+    }
+    
+    // Fetch videos
+    const videos = await fetchVideos(folderId);
+    console.log('Videos found:', videos.length);
+    
+    if (videos.length === 0) {
+      return res.status(404).json({ 
+        error: 'No videos found in folder. Make sure the folder is publicly accessible.' 
+      });
+    }
+    
+    // Sort videos by name with proper numeric sorting
+    videos.sort((a, b) => {
+      // Extract numbers from filenames (e.g., E01, Episode 1, 01, etc.)
+      const getNumber = (name) => {
+        const match = name.match(/(\d+)/);
+        return match ? parseInt(match[1], 10) : 0;
+      };
+      
+      const numA = getNumber(a.name);
+      const numB = getNumber(b.name);
+      
+      // If both have numbers, sort by number
+      if (numA !== numB) {
+        return numA - numB;
+      }
+      
+      // Otherwise, sort alphabetically
+      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+    });
+    
+    // Create W2G room if needed
+    if (!appState.roomId) {
+      console.log('Creating new W2G room...');
+      appState.roomId = await createW2GRoom();
+    }
+    
+    // Update state
+    appState.folderId = folderId;
+    appState.episodes = videos;
+    appState.currentEpisodeIndex = 0;
+    
+    // Load first episode
+    if (videos.length > 0) {
+      const firstVideo = videos[0];
+      console.log('Loading first episode:', firstVideo.name, 'URL:', firstVideo.streamUrl);
+      await updateW2GRoom(appState.roomId, firstVideo.streamUrl);
+    }
+    
+    res.json({
+      roomId: appState.roomId,
+      episodes: videos.map(v => ({ id: v.id, name: v.name })),
+      currentIndex: 0
+    });
+  } catch (error) {
+    console.error('Error in /api/init:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get current state
+app.get('/api/state', (req, res) => {
+  res.json({
+    roomId: appState.roomId,
+    episodes: appState.episodes.map(v => ({ id: v.id, name: v.name })),
+    currentIndex: appState.currentEpisodeIndex
+  });
+});
+
+// Play specific episode
+app.post('/api/play', async (req, res) => {
+  try {
+    const { index } = req.body;
+    
+    if (!appState.roomId || appState.episodes.length === 0) {
+      return res.status(400).json({ error: 'No playlist initialized' });
+    }
+    
+    if (index < 0 || index >= appState.episodes.length) {
+      return res.status(400).json({ error: 'Invalid episode index' });
+    }
+    
+    appState.currentEpisodeIndex = index;
+    const episode = appState.episodes[index];
+    console.log('Playing episode:', episode.name, 'URL:', episode.streamUrl);
+    await updateW2GRoom(appState.roomId, episode.streamUrl);
+    
+    res.json({
+      currentIndex: appState.currentEpisodeIndex,
+      episode: { id: episode.id, name: episode.name }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Navigate episodes
+app.post('/api/navigate', async (req, res) => {
+  try {
+    const { direction } = req.body;
+    
+    if (!appState.roomId || appState.episodes.length === 0) {
+      return res.status(400).json({ error: 'No playlist initialized' });
+    }
+    
+    let newIndex = appState.currentEpisodeIndex;
+    if (direction === 'next') {
+      newIndex = Math.min(newIndex + 1, appState.episodes.length - 1);
+    } else if (direction === 'prev') {
+      newIndex = Math.max(newIndex - 1, 0);
+    }
+    
+    if (newIndex !== appState.currentEpisodeIndex) {
+      appState.currentEpisodeIndex = newIndex;
+      const episode = appState.episodes[newIndex];
+      console.log('Navigating to episode:', episode.name, 'URL:', episode.streamUrl);
+      await updateW2GRoom(appState.roomId, episode.streamUrl);
+    }
+    
+    res.json({
+      currentIndex: appState.currentEpisodeIndex,
+      episode: appState.episodes[appState.currentEpisodeIndex]
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create new room
+app.post('/api/new-room', async (req, res) => {
+  try {
+    console.log('Creating new W2G room...');
+    appState.roomId = await createW2GRoom();
+    
+    // If we have episodes loaded, load the current one
+    if (appState.episodes.length > 0) {
+      const episode = appState.episodes[appState.currentEpisodeIndex];
+      await updateW2GRoom(appState.roomId, episode.streamUrl);
+    }
+    
+    res.json({ roomId: appState.roomId });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Serve HTML
+app.get('/', (req, res) => {
+  res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Watch2Gether Drive Player</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: #0f0f0f;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    
+    .header {
+      text-align: center;
+      margin-bottom: 30px;
+      color: white;
+    }
+    
+    .header h1 {
+      font-size: 32px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      text-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
+    }
+    
+    .header p {
+      opacity: 0.7;
+      font-size: 14px;
+      color: #a0a0a0;
+    }
+    
+    .card {
+      background: #1a1a1a;
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 20px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border: 1px solid #2a2a2a;
+    }
+    
+    .input-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    
+    input[type="text"] {
+      flex: 1;
+      padding: 14px 18px;
+      border: 2px solid #2a2a2a;
+      border-radius: 10px;
+      font-size: 14px;
+      transition: all 0.3s;
+      outline: none;
+      background: #0f0f0f;
+      color: #ffffff;
+    }
+    
+    input[type="text"]:focus {
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+    }
+    
+    input[type="text"]::placeholder {
+      color: #666;
+    }
+    
+    button {
+      padding: 14px 24px;
+      border: none;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+      outline: none;
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+    }
+    
+    .btn-secondary {
+      background: #2a2a2a;
+      color: #ffffff;
+      border: 2px solid #3a3a3a;
+    }
+    
+    .btn-secondary:hover {
+      background: #3a3a3a;
+      border-color: #4a4a4a;
+    }
+    
+    .btn-success {
+      background: #48bb78;
+      color: white;
+    }
+    
+    .btn-success:hover {
+      background: #38a169;
+      transform: translateY(-2px);
+      box-shadow: 0 5px 20px rgba(72, 187, 120, 0.4);
+    }
+    
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+    
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-top: 15px;
+    }
+    
+    .controls button {
+      flex: 1;
+    }
+    
+    .current-episode {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 20px;
+      border-radius: 12px;
+      margin-bottom: 15px;
+      text-align: center;
+    }
+    
+    .current-episode h3 {
+      font-size: 14px;
+      opacity: 0.9;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    
+    .current-episode p {
+      font-size: 18px;
+      font-weight: 600;
+    }
+    
+    .episode-list {
+      max-height: 400px;
+      overflow-y: auto;
+      margin-top: 15px;
+    }
+    
+    .episode-list::-webkit-scrollbar {
+      width: 8px;
+    }
+    
+    .episode-list::-webkit-scrollbar-track {
+      background: #0f0f0f;
+      border-radius: 10px;
+    }
+    
+    .episode-list::-webkit-scrollbar-thumb {
+      background: #3a3a3a;
+      border-radius: 10px;
+    }
+    
+    .episode-list::-webkit-scrollbar-thumb:hover {
+      background: #4a4a4a;
+    }
+    
+    .episode-item {
+      padding: 14px 16px;
+      margin-bottom: 8px;
+      border-radius: 10px;
+      background: #2a2a2a;
+      cursor: pointer;
+      transition: all 0.3s;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border: 1px solid #3a3a3a;
+    }
+    
+    .episode-item:hover {
+      background: #3a3a3a;
+      transform: translateX(4px);
+      border-color: #667eea;
+    }
+    
+    .episode-item.active {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      font-weight: 600;
+      border-color: transparent;
+    }
+    
+    .episode-number {
+      width: 32px;
+      height: 32px;
+      background: #0f0f0f;
+      color: #667eea;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+    
+    .episode-item.active .episode-number {
+      background: rgba(255,255,255,0.2);
+      color: white;
+    }
+    
+    .episode-name {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #e0e0e0;
+    }
+    
+    .episode-item.active .episode-name {
+      color: white;
+    }
+    
+    .message {
+      padding: 12px 16px;
+      border-radius: 10px;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+    
+    .message.error {
+      background: #3d1a1a;
+      color: #ff6b6b;
+      border: 1px solid #5a2020;
+    }
+    
+    .message.success {
+      background: #1a3d2e;
+      color: #51cf66;
+      border: 1px solid #205a3b;
+    }
+    
+    .message.info {
+      background: #1a2d3d;
+      color: #4dabf7;
+      border: 1px solid #204a5a;
+    }
+    
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: #666;
+    }
+    
+    .empty-state svg {
+      width: 64px;
+      height: 64px;
+      margin-bottom: 16px;
+      opacity: 0.5;
+    }
+    
+    .room-info {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 12px 16px;
+      background: #0f0f0f;
+      border-radius: 10px;
+      margin-bottom: 15px;
+      font-size: 13px;
+      color: #a0a0a0;
+      border: 1px solid #2a2a2a;
+    }
+    
+    .room-info strong {
+      color: #e0e0e0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🎬 Watch2Gether Player</h1>
+      <p>Load your Google Drive playlist and watch together</p>
+    </div>
+    
+    <div class="card">
+      <div class="input-group">
+        <input type="text" id="folderUrl" placeholder="Paste Google Drive folder link here...">
+        <button class="btn-primary" onclick="loadPlaylist()">Load Playlist</button>
+      </div>
+      <div id="initMessage"></div>
+    </div>
+    
+    <div class="card" id="playerCard" style="display: none;">
+      <div class="room-info" id="roomInfo">
+        <strong>Room:</strong> <span id="roomId">-</span>
+        <div style="flex: 1"></div>
+        <button class="btn-secondary" onclick="createNewRoom()" style="padding: 8px 16px; font-size: 12px;">🔄 New Room</button>
+      </div>
+      
+      <div class="current-episode" id="currentEpisode">
+        <h3>Now Playing</h3>
+        <p>No episode selected</p>
+      </div>
+      
+      <div class="controls">
+        <button class="btn-secondary" onclick="navigate('prev')" id="prevBtn">
+          ⬅️ Previous
+        </button>
+        <button class="btn-success" onclick="openRoom()" id="openBtn">
+          🎬 Open Watch2Gether
+        </button>
+        <button class="btn-secondary" onclick="navigate('next')" id="nextBtn">
+          Next ➡️
+        </button>
+      </div>
+      
+      <div class="episode-list" id="episodeList">
+        <div class="empty-state">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+          </svg>
+          <p>No episodes loaded</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let state = { roomId: null, episodes: [], currentIndex: 0 };
+
+    async function loadPlaylist() {
+      const folderUrl = document.getElementById('folderUrl').value.trim();
+      const msgEl = document.getElementById('initMessage');
+      
+      if (!folderUrl) {
+        msgEl.innerHTML = '<div class="message error">Please enter a folder URL</div>';
+        return;
+      }
+      
+      msgEl.innerHTML = '<div class="message info">⏳ Loading playlist...</div>';
+      
+      try {
+        const response = await fetch('/api/init', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folderUrl })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to load playlist');
+        }
+        
+        state = data;
+        updateUI();
+        document.getElementById('playerCard').style.display = 'block';
+        msgEl.innerHTML = '<div class="message success">✓ Playlist loaded successfully!</div>';
+      } catch (error) {
+        msgEl.innerHTML = '<div class="message error">❌ ' + error.message + '</div>';
+      }
+    }
+
+    async function navigate(direction) {
+      try {
+        const response = await fetch('/api/navigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ direction })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to navigate');
+        }
+        
+        state.currentIndex = data.currentIndex;
+        updateUI();
+      } catch (error) {
+        alert('Error: ' + error.message);
+      }
+    }
+
+    async function playEpisode(index) {
+      try {
+        const response = await fetch('/api/play', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index })
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to play episode');
+        }
+        
+        state.currentIndex = data.currentIndex;
+        updateUI();
+      } catch (error) {
+        alert('Error: ' + error.message);
+      }
+    }
+
+    async function createNewRoom() {
+      if (!confirm('Create a new Watch2Gether room? The old room will no longer be used.')) {
+        return;
+      }
+      
+      try {
+        const response = await fetch('/api/new-room', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+          throw new Error(data.error || 'Failed to create room');
+        }
+        
+        state.roomId = data.roomId;
+        updateUI();
+        alert('✓ New room created! Click "Open Watch2Gether" to join.');
+      } catch (error) {
+        alert('Error: ' + error.message);
+      }
+    }
+
+    function openRoom() {
+      if (state.roomId) {
+        window.open('https://w2g.tv/rooms/' + state.roomId, '_blank');
+      }
+    }
+
+    function updateUI() {
+      const hasEpisodes = state.episodes && state.episodes.length > 0;
+      
+      // Update room info
+      if (state.roomId) {
+        document.getElementById('roomId').textContent = state.roomId;
+      }
+      
+      // Update current episode display
+      if (hasEpisodes) {
+        const current = state.episodes[state.currentIndex];
+        document.getElementById('currentEpisode').innerHTML = 
+          '<h3>Episode ' + (state.currentIndex + 1) + ' of ' + state.episodes.length + '</h3>' +
+          '<p>' + current.name + '</p>';
+      }
+      
+      // Update episode list
+      if (hasEpisodes) {
+        document.getElementById('episodeList').innerHTML = state.episodes
+          .map((ep, i) => 
+            '<div class="episode-item ' + (i === state.currentIndex ? 'active' : '') + '" onclick="playEpisode(' + i + ')">' +
+              '<div class="episode-number">' + (i + 1) + '</div>' +
+              '<div class="episode-name">' + ep.name + '</div>' +
+            '</div>'
+          ).join('');
+      }
+      
+      // Enable/disable buttons
+      document.getElementById('prevBtn').disabled = !hasEpisodes || state.currentIndex === 0;
+      document.getElementById('nextBtn').disabled = !hasEpisodes || state.currentIndex === state.episodes.length - 1;
+      document.getElementById('openBtn').disabled = !state.roomId;
+    }
+
+    // Load state on page load
+    fetch('/api/state')
+      .then(r => r.json())
+      .then(data => {
+        state = data;
+        if (state.episodes && state.episodes.length > 0) {
+          document.getElementById('playerCard').style.display = 'block';
+        }
+        updateUI();
+      });
+  </script>
+</body>
+</html>
+  `);
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+});
